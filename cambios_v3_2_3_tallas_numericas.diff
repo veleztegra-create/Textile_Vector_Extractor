@@ -1,0 +1,204 @@
+--- Textile_Vector_Extractor_v3_2_3.py (entregada)
++++ Textile_Vector_Extractor_v3_2_3.py (tallas numéricas)
+@@ -213,12 +213,21 @@
+     return SIZE_ORDER[i:j + 1]
+ 
+ 
++def order_sizes(sizes):
++    """Letras (XS..5XL) en su orden y, después, las tallas numéricas (40, 44, 48...) de menor a mayor."""
++    s = set(sizes)
++    return [x for x in SIZE_ORDER if x in s] + sorted((x for x in s if str(x).isdigit()), key=int)
++
++
+ def detect_sizes(layer_names, text_lines):
+-    """Tallas del PDF: primero por capas (S, M, L, 2XL...), si no por rangos de texto (S-3XL)."""
++    """Tallas del PDF: primero por capas (S, M, L, 2XL... o numéricas 40, 44...), si no por texto (S-3XL, 'Size: 40,44,48')."""
+     found = {normalize_size(n) for n in layer_names if SIZE_LAYER_RE.match((n or "").strip())}
+     found.discard(None)
+     if found:
+         return [s for s in SIZE_ORDER if s in found], "las capas del PDF"
++    nums = {str(int(n.strip())) for n in layer_names if re.fullmatch(r"\d{2,3}", (n or "").strip()) and 20 <= int(n.strip()) <= 200}
++    if len(nums) >= 2:                      # capas de talla numérica (la clasificación ya las trata como capas de talla)
++        return order_sizes(nums), "las capas del PDF"
+     rng = set()
+     for t in text_lines:
+         for m in SIZE_RANGE_RE.finditer(t):
+@@ -227,7 +236,7 @@
+         sp = parse_size_spec(t, lone=False)
+         if sp:
+             rng.update(sp["sizes"])
+-    return [s for s in SIZE_ORDER if s in rng], ("el texto del PDF" if rng else "")
++    return order_sizes(rng), ("el texto del PDF" if rng else "")
+ 
+ 
+ # ---------------------------------------------------------------- tallas por pieza (v3.2.3)
+@@ -237,7 +246,7 @@
+ _SZ_SEP = r"(?:[-\u2013\u2014/,&+]|\bTO\b|\bTHRU\b)"
+ _SZ_NUM = r"[2-5]\s*[-\u2013\u2014/]\s*[2-5]\s*XL?"
+ _SZ_KW_RE = re.compile(
+-    r"(?<![A-Za-z0-9])(?P<kw>(?:SIZES?|TALLAS?|SZ)\s*[:=#\-]?\s*)"
++    r"(?<![A-Za-z0-9])(?P<kw>(?:SIZES?|TALLAS?|SZ)\b\s*[:=#\-]?\s*)"
+     r"(?:(?P<num>" + _SZ_NUM + r")|(?P<seq>" + _SZ_TOK + r"(?:(?:\s*" + _SZ_SEP + r"\s*|\s+)" + _SZ_TOK + r")*))(?![A-Za-z0-9])",
+     re.IGNORECASE)
+ _SZ_GEN_RE = re.compile(
+@@ -245,6 +254,16 @@
+     re.IGNORECASE)
+ 
+ 
++# Tallas NUMÉRICAS (p. ej. 'Size: 40,44,48,52,56,60,64'): solo se aceptan tras la palabra Size/Talla, porque un número suelto puede ser
++# una medida, un estilo o un código. No se aceptan decimales ni medidas con unidad (cm, mm, in), y un rango 'Size: 40-64' NO se expande
++# (no se sabe de cuánto en cuánto va la serie): se deja sin leer y la pieza usa la lista global.
++_SZ_KWNUM_RE = re.compile(
++    r"(?<![A-Za-z0-9])(?P<kw>(?:SIZES?|TALLAS?|SZ)\b\s*[:=#]?\s*)"
++    r"(?P<nums>\d{1,3}(?:(?:\s*[,;/]\s*|\s+)\d{1,3})*)"
++    r"(?![A-Za-z0-9])(?!\.\d)(?!\s*[-\u2013\u2014]\s*\d)(?!\s*(?:cm|mm|in|pt)\b)",
++    re.IGNORECASE)
++
++
+ def _norm_tok(t):
+     t = re.sub(r"\s+", "", t or "").upper()
+     m = re.fullmatch(r"([2-5])XL?", t)
+@@ -276,7 +295,7 @@
+ 
+ 
+ def parse_size_spec(text, lone=True):
+-    """Tallas escritas en un texto. Devuelve {'sizes': [...en SIZE_ORDER], 'spans': [...], 'multi': bool} o None.
++    """Tallas escritas en un texto. Devuelve {'sizes': [...letras en SIZE_ORDER y numéricas de menor a mayor], 'spans': [...], 'multi': bool} o None.
+     lone=False ignora las tallas sueltas (XL, 2XL...) y exige un rango o lista con separador."""
+     text = text or ""
+     sizes, spans, taken = set(), [], []
+@@ -302,13 +321,22 @@
+     for m in _SZ_KW_RE.finditer(text):
+         if take(m, True):
+             taken.append(m.span())
++    for m in _SZ_KWNUM_RE.finditer(text):                    # 'Size: 40,44,48,52,56,60,64'
++        if any(m.start() < b and a < m.end() for a, b in taken):
++            continue
++        nums = {str(int(t)) for t in re.findall(r"\d{1,3}", m.group("nums")) if 1 <= int(t) <= 200}
++        if nums:
++            sizes.update(nums)
++            spans.append(m.span())
++            taken.append(m.span())
++            stat["n"] += 1
+     for m in _SZ_GEN_RE.finditer(text):
+         if any(m.start() < b and a < m.end() for a, b in taken):
+             continue
+         take(m, False)
+     if not sizes:
+         return None
+-    return {"sizes": [s for s in SIZE_ORDER if s in sizes], "spans": sorted(spans), "multi": stat["n"] > 1 or stat["rng"] > 1}
++    return {"sizes": order_sizes(sizes), "spans": sorted(spans), "multi": stat["n"] > 1 or stat["rng"] > 1}
+ 
+ 
+ def remove_size_text(text, spans):
+@@ -330,7 +358,7 @@
+ 
+ 
+ def size_label(sizes):
+-    """['S','M'] -> 'S-M'; ['L','XL'] -> 'L-XL'; ['2XL','3XL'] -> '2XL-3XL'; no contiguas -> 'S-M+2XL'."""
++    """['S','M'] -> 'S-M'; ['L','XL'] -> 'L-XL'; ['2XL','3XL'] -> '2XL-3XL'; no contiguas -> 'S-M+2XL'; numéricas -> '40-44-48'."""
+     idx = sorted({SIZE_ORDER.index(s) for s in sizes if s in SIZE_ORDER})
+     runs = []
+     for i in idx:
+@@ -338,7 +366,11 @@
+             runs[-1][1] = i
+         else:
+             runs.append([i, i])
+-    return "+".join(SIZE_ORDER[a] if a == b else f"{SIZE_ORDER[a]}-{SIZE_ORDER[b]}" for a, b in runs)
++    parts = [SIZE_ORDER[a] if a == b else f"{SIZE_ORDER[a]}-{SIZE_ORDER[b]}" for a, b in runs]
++    nums = sorted((s for s in sizes if str(s).isdigit()), key=int)
++    if nums:
++        parts.append("-".join(str(n) for n in nums))          # tallas numéricas: 40-44-48-52-56-60-64
++    return "+".join(parts)
+ 
+ 
+ def parse_pdf_filename(filename):
+@@ -533,7 +565,8 @@
+ 
+ 
+ def _strip_noise(txt):
+-    t = re.sub(r"\bSize\s*:\s*[\w\-/]+", " ", txt, flags=re.IGNORECASE)
++    t = re.sub(r"\bSizes?\s*:\s*\d{1,3}(?:(?:\s*[,;/]\s*|\s+)\d{1,3})*(?![\w.])", " ", txt, flags=re.IGNORECASE)   # Size: 40,44,48,52
++    t = re.sub(r"\bSize\s*:\s*[\w\-/]+", " ", t, flags=re.IGNORECASE)
+     t = SIZE_RANGE_RE.sub(" ", t)
+     return re.sub(r"\s+", " ", t).strip()
+ 
+@@ -807,7 +840,7 @@
+             sizes |= set(r2["sizes"])
+     if not re.search(r"[A-Za-z0-9]", base or ""):
+         return name, []
+-    return base, [x for x in SIZE_ORDER if x in sizes]
++    return base, order_sizes(sizes)
+ 
+ 
+ def legacy_window(label_rect):
+@@ -2435,6 +2468,13 @@
+ 
+         // ================= Integración con el Sistema de Costos =================
+         const SIZE_ORDER = ['XS', 'S', 'M', 'L', 'XL', '2XL', '3XL', '4XL', '5XL'];
++        // Letras (XS..5XL) y, después, las tallas numéricas (40, 44, 48...) detectadas en el PDF o propias de alguna pieza.
++        const isNumSize = s => /^\d+$/.test(String(s));
++        function allSizes() {
++            const nums = new Set();
++            [...(state.sizesDetected || []), ...(state.sizesSel || []), ...((state.pieces || []).flatMap(p => p.sizes || []))].forEach(s => { if (isNumSize(s)) nums.add(String(s)); });
++            return SIZE_ORDER.concat([...nums].sort((a, b) => a - b));
++        }
+         const USER_TEAMS_KEY = 'tegra_team_catalog_v1';
+         const loadUserTeams = () => { try { return JSON.parse(localStorage.getItem(USER_TEAMS_KEY) || '{}'); } catch { return {}; } };
+         const saveUserTeams = () => { try { localStorage.setItem(USER_TEAMS_KEY, JSON.stringify(state.userTeams)); } catch {} };
+@@ -2466,7 +2506,7 @@
+ 
+         function renderSizeChips(source) {
+             const box = $('sizeChips'); box.innerHTML = '';
+-            SIZE_ORDER.forEach(s => {
++            allSizes().forEach(s => {
+                 const b = document.createElement('button');
+                 b.type = 'button'; b.textContent = s;
+                 const paint = () => { b.className = 'px-1.5 py-0.5 rounded border text-[10px] font-mono transition ' +
+@@ -2525,7 +2565,7 @@
+             const names = fileNames();
+             const q = costQuery().toString();
+             const sendRefs = $('chkSendRefs').checked, rq = refQuery().toString();
+-            const sel = SIZE_ORDER.filter(s => state.sizesSel.has(s));
++            const sel = allSizes().filter(s => state.sizesSel.has(s));
+             // Talla propia de la pieza (la del bloque de su etiqueta), limitada a las tallas seleccionadas arriba; sin talla propia, se usa la lista global.
+             const tallasDe = p => { const own = p.sizes || []; if (!own.length || !sel.length) return own; const f = own.filter(s => sel.includes(s)); return f.length ? f : own; };
+             const payload = {
+@@ -3161,6 +3201,9 @@
+     <script>
+         let imagenesProcesadas = [];
+         let tallasSeleccionadas = new Set(['XS', 'S', 'M', 'L', 'XL', '2XL', '3XL', '4XL', '5XL']);
++        const TALLAS_LETRAS = ['XS', 'S', 'M', 'L', 'XL', '2XL', '3XL', '4XL', '5XL'];
++        let tallasNumericas = new Set();       // tallas numéricas (40, 44, 48...) recibidas del extractor: se muestran junto a las de letras
++        const tallasVisibles = () => TALLAS_LETRAS.concat(Array.from(tallasNumericas).sort((a, b) => a - b));
+         
+         const dropZone = document.getElementById('dropZone');
+         const fileInput = document.getElementById('fileInput');
+@@ -3176,7 +3219,7 @@
+         
+         // ========== INICIALIZACIÓN ==========
+         function inicializarTallas() {
+-            const tallas = ['XS', 'S', 'M', 'L', 'XL', '2XL', '3XL', '4XL', '5XL'];
++            const tallas = tallasVisibles();
+             tallasGrid.innerHTML = '';
+             
+             tallas.forEach(talla => {
+@@ -3202,8 +3245,8 @@
+         }
+         
+         function seleccionarTodasTallas() {
+-            const todasSeleccionadas = tallasSeleccionadas.size === 9;
+-            const tallas = ['XS', 'S', 'M', 'L', 'XL', '2XL', '3XL', '4XL', '5XL'];
++            const tallas = tallasVisibles();
++            const todasSeleccionadas = tallas.every(t => tallasSeleccionadas.has(t));
+             
+             if (todasSeleccionadas) {
+                 tallasSeleccionadas.clear();
+@@ -4273,6 +4316,7 @@
+         async function recibirDesdeExtractor(p) {
+             const piezas = p.pieces || [];
+             const fallos = [];
++            [].concat(p.sizes || [], ...piezas.map(pz => pz.sizes || [])).forEach(t => { if (/^\d+$/.test(String(t))) tallasNumericas.add(String(t)); });
+             if (p.sizes && p.sizes.length) {
+                 tallasSeleccionadas = new Set(p.sizes);
+                 inicializarTallas();
