@@ -1,0 +1,560 @@
+--- Textile_Vector_Extractor_v3_2_2.py (final)
++++ Textile_Vector_Extractor_v3_2_3.py
+@@ -1,5 +1,5 @@
+ """
+-Textile Vector Extractor v3.2.2 + Sistema de Costos Serigrafía (integrados en una sola app)
++Textile Vector Extractor v3.2.3 + Sistema de Costos Serigrafía (integrados en una sola app)
+ Motor real (PyMuPDF) + interfaz "Tegra Pre-Press Suite". Pestaña 1: Extractor. Pestaña 2: Costos.
+ 
+ Uso:    python Textile_Vector_Extractor.py        (abre http://localhost:8000)
+@@ -35,7 +35,7 @@
+ except ImportError:
+     import fitz
+ 
+-VERSION = "v3.2.2"
++VERSION = "v3.2.3"
+ PORT = 8000
+ 
+ # ---------------------------------------------------------------- Configuración
+@@ -213,18 +213,164 @@
+     return SIZE_ORDER[i:j + 1]
+ 
+ 
++def order_sizes(sizes):
++    """Letras (XS..5XL) en su orden y, después, las tallas numéricas (40, 44, 48...) de menor a mayor."""
++    s = set(sizes)
++    return [x for x in SIZE_ORDER if x in s] + sorted((x for x in s if str(x).isdigit()), key=int)
++
++
+ def detect_sizes(layer_names, text_lines):
+-    """Tallas del PDF: primero por capas (S, M, L, 2XL...), si no por rangos de texto (S-3XL)."""
++    """Tallas del PDF: primero por capas (S, M, L, 2XL... o numéricas 40, 44...), si no por texto (S-3XL, 'Size: 40,44,48')."""
+     found = {normalize_size(n) for n in layer_names if SIZE_LAYER_RE.match((n or "").strip())}
+     found.discard(None)
+     if found:
+         return [s for s in SIZE_ORDER if s in found], "las capas del PDF"
++    nums = {str(int(n.strip())) for n in layer_names if re.fullmatch(r"\d{2,3}", (n or "").strip()) and 20 <= int(n.strip()) <= 200}
++    if len(nums) >= 2:                      # capas de talla numérica (la clasificación ya las trata como capas de talla)
++        return order_sizes(nums), "las capas del PDF"
+     rng = set()
+     for t in text_lines:
+         for m in SIZE_RANGE_RE.finditer(t):
+             a, b = re.split(r"\s*-\s*", m.group(0))
+             rng.update(expand_size_range(a, b))
+-    return [s for s in SIZE_ORDER if s in rng], ("el texto del PDF" if rng else "")
++        sp = parse_size_spec(t, lone=False)
++        if sp:
++            rng.update(sp["sizes"])
++    return order_sizes(rng), ("el texto del PDF" if rng else "")
++
++
++# ---------------------------------------------------------------- tallas por pieza (v3.2.3)
++# Reconoce rangos y listas de tallas escritos de muchas formas: S-M, L-XL, 2-3XL, 2XL-3XL, XXL-3XL, XS/S, S,M,
++# "Size: S-M", "(L-XL)", "COLLAR_2XL-3XL"... Una S, M o L suelta NO cuenta como talla (puede ser Left), salvo tras "Size:"/"Talla:".
++_SZ_TOK = r"(?:[2-5]XL?|X{2,5}L|XL|XS|S|M|L)"
++_SZ_SEP = r"(?:[-\u2013\u2014/,&+]|\bTO\b|\bTHRU\b)"
++_SZ_NUM = r"[2-5]\s*[-\u2013\u2014/]\s*[2-5]\s*XL?"
++_SZ_KW_RE = re.compile(
++    r"(?<![A-Za-z0-9])(?P<kw>(?:SIZES?|TALLAS?|SZ)\b\s*[:=#\-]?\s*)"
++    r"(?:(?P<num>" + _SZ_NUM + r")|(?P<seq>" + _SZ_TOK + r"(?:(?:\s*" + _SZ_SEP + r"\s*|\s+)" + _SZ_TOK + r")*))(?![A-Za-z0-9])",
++    re.IGNORECASE)
++_SZ_GEN_RE = re.compile(
++    r"(?<![A-Za-z0-9])(?:(?P<num>" + _SZ_NUM + r")|(?P<seq>" + _SZ_TOK + r"(?:\s*" + _SZ_SEP + r"\s*" + _SZ_TOK + r")*))(?![A-Za-z0-9])",
++    re.IGNORECASE)
++
++
++# Tallas NUMÉRICAS (p. ej. 'Size: 40,44,48,52,56,60,64'): solo se aceptan tras la palabra Size/Talla, porque un número suelto puede ser
++# una medida, un estilo o un código. No se aceptan decimales ni medidas con unidad (cm, mm, in), y un rango 'Size: 40-64' NO se expande
++# (no se sabe de cuánto en cuánto va la serie): se deja sin leer y la pieza usa la lista global.
++_SZ_KWNUM_RE = re.compile(
++    r"(?<![A-Za-z0-9])(?P<kw>(?:SIZES?|TALLAS?|SZ)\b\s*[:=#]?\s*)"
++    r"(?P<nums>\d{1,3}(?:(?:\s*[,;/]\s*|\s+)\d{1,3})*)"
++    r"(?![A-Za-z0-9])(?!\.\d)(?!\s*[-\u2013\u2014]\s*\d)(?!\s*(?:cm|mm|in|pt)\b)",
++    re.IGNORECASE)
++
++
++def _norm_tok(t):
++    t = re.sub(r"\s+", "", t or "").upper()
++    m = re.fullmatch(r"([2-5])XL?", t)
++    if m:
++        return f"{m.group(1)}XL"
++    m = re.fullmatch(r"(X{2,5})L", t)
++    if m:
++        return f"{len(m.group(1))}XL"
++    return t if t in SIZE_ORDER else None
++
++
++def _eval_seq(seq):
++    """Evalúa 'S-M', 'XS/S', 'S,M,L'... De izquierda a derecha: '-' / 'TO' / 'THRU' forman rango; '/', ',', '&', '+' o espacio, lista."""
++    sizes, prev, rng, n_rng = set(), None, False, 0
++    for m in re.finditer(r"(?P<t>" + _SZ_TOK + r")|(?P<s>" + _SZ_SEP + r")", seq, re.IGNORECASE):
++        if m.group("t"):
++            tok = _norm_tok(m.group("t"))
++            if tok is None:
++                continue
++            if rng and prev:
++                sizes.update(expand_size_range(prev, tok))
++                n_rng += 1
++            else:
++                sizes.add(tok)
++            prev, rng = tok, False
++        else:
++            rng = m.group("s").upper() in ("-", "\u2013", "\u2014", "TO", "THRU")
++    return sizes, n_rng
++
++
++def parse_size_spec(text, lone=True):
++    """Tallas escritas en un texto. Devuelve {'sizes': [...letras en SIZE_ORDER y numéricas de menor a mayor], 'spans': [...], 'multi': bool} o None.
++    lone=False ignora las tallas sueltas (XL, 2XL...) y exige un rango o lista con separador."""
++    text = text or ""
++    sizes, spans, taken = set(), [], []
++    stat = {"n": 0, "rng": 0}
++
++    def take(m, kw_mode):
++        if m.group("num"):
++            a, b = re.findall(r"[2-5]", m.group("num"))[:2]
++            got, rng = set(expand_size_range(f"{a}XL", f"{b}XL")), 1
++        else:
++            toks = re.findall(_SZ_TOK, m.group("seq"), re.IGNORECASE)
++            if not kw_mode and len(toks) == 1 and (len(toks[0]) == 1 or not lone):
++                return False
++            got, rng = _eval_seq(m.group("seq"))
++        if not got:
++            return False
++        sizes.update(got)
++        spans.append(m.span())
++        stat["n"] += 1
++        stat["rng"] += rng
++        return True
++
++    for m in _SZ_KW_RE.finditer(text):
++        if take(m, True):
++            taken.append(m.span())
++    for m in _SZ_KWNUM_RE.finditer(text):                    # 'Size: 40,44,48,52,56,60,64'
++        if any(m.start() < b and a < m.end() for a, b in taken):
++            continue
++        nums = {str(int(t)) for t in re.findall(r"\d{1,3}", m.group("nums")) if 1 <= int(t) <= 200}
++        if nums:
++            sizes.update(nums)
++            spans.append(m.span())
++            taken.append(m.span())
++            stat["n"] += 1
++    for m in _SZ_GEN_RE.finditer(text):
++        if any(m.start() < b and a < m.end() for a, b in taken):
++            continue
++        take(m, False)
++    if not sizes:
++        return None
++    return {"sizes": order_sizes(sizes), "spans": sorted(spans), "multi": stat["n"] > 1 or stat["rng"] > 1}
++
++
++def remove_size_text(text, spans):
++    t = text or ""
++    for a, b in sorted(spans, reverse=True):
++        t = t[:a] + " " + t[b:]
++    t = re.sub(r"[\(\[\{]\s*[\)\]\}]", " ", t)
++    t = re.sub(r"\s+", " ", t).strip()
++    return re.sub(r"^[\s_\-\u2013\u2014/,&+:]+|[\s_\-\u2013\u2014/,&+:]+$", "", t)
++
++
++def parse_pure_size_line(text):
++    """Tallas de una línea que es SOLO una talla/rango (p. ej. '(S-M)', '2-3XL', 'Size: L-XL'); None si trae algo más."""
++    t = re.sub(r"^[\(\[\{]\s*|\s*[\)\]\}]$", "", (text or "").strip())
++    r = parse_size_spec(t, lone=True)
++    if not r or r["multi"] or re.search(r"[A-Za-z0-9]", remove_size_text(t, r["spans"])):
++        return None
++    return r["sizes"]
++
++
++def size_label(sizes):
++    """['S','M'] -> 'S-M'; ['L','XL'] -> 'L-XL'; ['2XL','3XL'] -> '2XL-3XL'; no contiguas -> 'S-M+2XL'; numéricas -> '40-44-48'."""
++    idx = sorted({SIZE_ORDER.index(s) for s in sizes if s in SIZE_ORDER})
++    runs = []
++    for i in idx:
++        if runs and i == runs[-1][1] + 1:
++            runs[-1][1] = i
++        else:
++            runs.append([i, i])
++    parts = [SIZE_ORDER[a] if a == b else f"{SIZE_ORDER[a]}-{SIZE_ORDER[b]}" for a, b in runs]
++    nums = sorted((s for s in sizes if str(s).isdigit()), key=int)
++    if nums:
++        parts.append("-".join(str(n) for n in nums))          # tallas numéricas: 40-44-48-52-56-60-64
++    return "+".join(parts)
+ 
+ 
+ def parse_pdf_filename(filename):
+@@ -419,7 +565,8 @@
+ 
+ 
+ def _strip_noise(txt):
+-    t = re.sub(r"\bSize\s*:\s*[\w\-/]+", " ", txt, flags=re.IGNORECASE)
++    t = re.sub(r"\bSizes?\s*:\s*\d{1,3}(?:(?:\s*[,;/]\s*|\s+)\d{1,3})*(?![\w.])", " ", txt, flags=re.IGNORECASE)   # Size: 40,44,48,52
++    t = re.sub(r"\bSize\s*:\s*[\w\-/]+", " ", t, flags=re.IGNORECASE)
+     t = SIZE_RANGE_RE.sub(" ", t)
+     return re.sub(r"\s+", " ", t).strip()
+ 
+@@ -431,6 +578,13 @@
+             if j != i and l["block"] == cur["block"] and _distance(cur["rect"], l["rect"]) <= 1.5 * h]
+ 
+ 
++def _neighbor_lines(lines, i):
++    cur = lines[i]
++    h = max(cur["rect"].height, 6)
++    return [l for j, l in enumerate(lines)
++            if j != i and l["block"] == cur["block"] and _distance(cur["rect"], l["rect"]) <= 1.5 * h]
++
++
+ def read_labels(page):
+     lines = text_lines(page)
+     style, style_rects, pieces = None, [], []
+@@ -443,11 +597,13 @@
+             if val and style is None:
+                 style = val
+             continue
+-        raw, used = None, [ln["rect"]]
++        raw, used, orig = None, [ln["rect"]], None
+         if PIECE_RE.search(txt):
+             raw, used = _value_for(lines, i, PIECE_RE)
++            orig = raw
+         elif DIM_RE.search(txt):
+             raw = _strip_noise(txt)
++            orig = txt            # _strip_noise quita las tallas del nombre: se conserva el texto original para leerlas
+             if not re.search(r"[A-Za-z]", DIM_RE.sub("", raw)):
+                 raw = None
+         if raw:
+@@ -456,7 +612,13 @@
+                 rect |= u
+             dup = any(p["raw"] == raw and _distance(p["rect"], rect) < 5 for p in pieces)
+             if not dup:
+-                pieces.append({"raw": raw, "rect": rect, "remove": used + _neighbor_rects(lines, i)})
++                near = []
++                for nl in _neighbor_lines(lines, i):
++                    sp = parse_pure_size_line(nl["text"])
++                    if sp and sp not in near:
++                        near.append(sp)
++                pieces.append({"raw": raw, "rect": rect, "remove": used + _neighbor_rects(lines, i),
++                               "orig": orig, "near_sizes": near[0] if len(near) == 1 else None})
+     return style, pieces, lines, style_rects
+ 
+ 
+@@ -571,6 +733,116 @@
+     return res
+ 
+ 
++# ---------------------------------------------------------------- piezas dobles y por talla (v3.2.3)
++_SIDE_RE = re.compile(r"(?<![A-Za-z0-9])(?:L|R|LT|RT|LFT|RGT|RGHT|LEFT|RIGHT|RIGTH|IZQ|IZQUIERDA|IZQUIERDO|DER|DERECHA|DERECHO)(?![A-Za-z0-9])", re.IGNORECASE)
++# familias que siempre vienen en pareja (izquierda/derecha); para ellas no se exige que las dos piezas midan parecido
++_PAIRED_RE = re.compile(r"(?<![A-Za-z0-9])(?:SLV|SLEEVES?|MANGAS?|SHLDRS?|SHDL|SHOULDERS?|HOMBROS?)(?![A-Za-z0-9])", re.IGNORECASE)
++_SHOULDER_RE = re.compile(r"(?<![A-Za-z0-9])(?:SHLDRS?|SHDL|SHOULDERS?|HOMBROS?)(?![A-Za-z0-9])", re.IGNORECASE)
++
++
++def has_side(name):
++    return bool(_SIDE_RE.search(name or ""))
++
++
++def is_paired_family(name):
++    return bool(_PAIRED_RE.search(name or ""))
++
++
++def sided_default_name(side, base):
++    """Nombre en inglés de una pieza con lado asignado. Hombros: 'Shoulder Left'/'Shoulder Right' (como los nombra el usuario);
++    el resto, lado primero ('Left sleeve', 'Left yoke piece'), usando el diccionario cuando lo reconoce."""
++    word = "Left" if side == "L" else "Right"
++    if _SHOULDER_RE.search(base or ""):
++        return f"Shoulder {word}"
++    t = translate_piece(f"{side} {base}")
++    if t.startswith(("Left ", "Right ")):
++        return t
++    b = translate_piece(base)
++    return f"{word} " + (b.title() if b.isupper() else b[:1].lower() + b[1:])
++
++
++def _sides_ok(a, b, family):
++    a, b = sorted((a, b), key=lambda r: r.x0 + r.x1)
++    if _x_overlap(a, b) > 0.5 * min(a.width, b.width):
++        return False, "no están una al lado de la otra"
++    if not family:
++        lo, hi = sorted((a.width * a.height, b.width * b.height))
++        if lo < 0.5 * hi:
++            return False, "no tienen tamaño parecido"
++    return True, ""
++
++
++def _per_target_sizes(targets, lines, regions, used):
++    """Una etiqueta con varias piezas, cada una con su propio texto de talla (S-M, L-XL, 2-3XL...) cerca.
++    Devuelve [(tallas, [índices de línea])] alineado con targets, o None si falta alguna, hay ambigüedad o se repiten."""
++    key = lambda r: tuple(round(v) for v in r)
++    per = {}
++    for li, ln in enumerate(lines):
++        if li in used:
++            continue
++        sz = parse_pure_size_line(ln["text"])
++        if not sz:
++            continue
++        owner = min(regions or targets, key=lambda r: _distance(ln["rect"], r))      # la región más cercana de TODA la hoja
++        hit = [i for i, t in enumerate(targets) if key(t) == key(owner)]
++        if not hit:
++            continue
++        t = targets[hit[0]]
++        if _distance(ln["rect"], t) <= max(40.0, 0.2 * max(t.width, t.height)):
++            per.setdefault(hit[0], []).append((li, sz))
++    if len(per) != len(targets):
++        return None
++    out = []
++    for i in range(len(targets)):
++        if len({tuple(sz) for _, sz in per[i]}) != 1:
++            return None
++        out.append((per[i][0][1], [li for li, _ in per[i]]))
++    if len({tuple(sz) for sz, _ in out}) != len(out):
++        return None
++    return out
++
++
++def plan_label(base, label_sizes, near_sizes, side_pref, targets, lines, regions, used):
++    """Decide cómo se nombra cada región de una etiqueta. Devuelve (specs, motivo, líneas_usadas):
++    specs = [{'side': 'L'|'R'|None, 'sizes': [...], 'part': k, 'parts': n}] alineado con targets; motivo != '' si hubo que avisar.
++    Las tallas NUNCA se incorporan al nombre: viajan en 'sizes' hasta la columna SIZE de Costos y del Excel."""
++    n = len(targets)
++    shared = label_sizes or near_sizes or []
++    if n == 1:
++        return [{"side": side_pref, "sizes": shared, "part": 1, "parts": 1}], "", []
++    reason = "ya tiene lado" if side_pref else ""
++    if not label_sizes and not side_pref:
++        per = _per_target_sizes(targets, lines, regions, used)
++        if per:                                              # una etiqueta, una talla propia por pieza: nombres numerados, tallas en 'sizes'
++            return ([{"side": None, "sizes": sz, "part": k, "parts": n} for k, (sz, _) in enumerate(per, 1)], "", [li for _, ls in per for li in ls])
++    if n == 2 and not side_pref:
++        if has_side(base):
++            reason = "el nombre ya indica el lado"
++        else:
++            ok, why = _sides_ok(targets[0], targets[1], is_paired_family(base))
++            if ok:                                           # pareja sin lado: izquierda de la hoja = Left, derecha = Right
++                order = sorted(range(2), key=lambda i: targets[i].x0 + targets[i].x1)
++                side = {order[0]: "L", order[1]: "R"}
++                return [{"side": side[i], "sizes": shared, "part": 1, "parts": 1} for i in range(2)], "", []
++            reason = why
++    elif n > 2:
++        reason = "no se pudieron distinguir por talla"
++    return [{"side": None, "sizes": shared, "part": k, "parts": n} for k in range(1, n + 1)], reason or "no se pudo asignar lado ni talla", []
++
++
++def _split_name_sizes(name, orig):
++    """('COLLAR S-M', ...) -> ('COLLAR', ['S','M']): las tallas salen del nombre y se guardan aparte; si el nombre fuera solo la talla se conserva."""
++    r = parse_size_spec(name, lone=True)
++    base, sizes = (remove_size_text(name, r["spans"]), set(r["sizes"])) if r else (name, set())
++    if orig and orig != name:
++        r2 = parse_size_spec(orig, lone=True)
++        if r2:
++            sizes |= set(r2["sizes"])
++    if not re.search(r"[A-Za-z0-9]", base or ""):
++        return name, []
++    return base, order_sizes(sizes)
++
++
+ def legacy_window(label_rect):
+     return fitz.Rect(
+         label_rect.x0 - LEGACY_LEFT_RIGHT, label_rect.y0 - LEGACY_ABOVE,
+@@ -755,13 +1027,21 @@
+ 
+         out = []
+ 
+-        def add_piece(pd, code, rect, label, part=1, parts=1):
++        extra_remove = {}                      # texto de talla usado para nombrar piezas: se borra del render como las etiquetas
++
++        def add_piece(pd, code, rect, label, part=1, parts=1, default_name=None, sizes=None, variant=""):
+             rect = fitz.Rect(rect) & pd["rect"]
+-            out.append({
++            d = {
+                 "id": f"p{len(out) + 1:02d}", "page": pd["pno"] + 1, "code": code,
+-                "default_name": translate_piece(code), "rect": _r(rect),
++                "default_name": default_name or translate_piece(code), "rect": _r(rect),
+                 "label": _r(label) if label is not None else None, "part": part, "parts": parts,
+-            })
++            }
++            if sizes:
++                d["sizes"] = list(sizes)                 # tallas que comprende esta pieza (solo si se detectaron): van a la columna SIZE
++                d["sizes_label"] = size_label(sizes)     # forma compacta para mostrarla: S-L, XL-5XL
++            if variant:
++                d["variant"] = variant                   # 'side': Left/Right asignado por el programa
++            out.append(d)
+ 
+         if total_labels:
+             mode = "A: etiquetas Piece Name"
+@@ -770,14 +1050,30 @@
+                 if not pieces:
+                     continue
+                 parsed = [parse_piece_name(p["raw"]) for p in pieces]
+-                idx = [i for i, n in enumerate(parsed) if n.upper() == "SLV"]
+-                if len(idx) == 2:
+-                    idx.sort(key=lambda i: pieces[i]["rect"].x0 + pieces[i]["rect"].x1)
+-                    parsed[idx[0]], parsed[idx[1]] = "L SLV", "R SLV"
++                bases, lsizes = [], []
++                for p, name in zip(pieces, parsed):
++                    b, sz = _split_name_sizes(name, p.get("orig"))
++                    bases.append(b)
++                    lsizes.append(sz)
++                # Dos etiquetas iguales de una familia en pareja (mangas, hombros) sin lado: izquierda de la hoja = Left, derecha = Right
++                side_pref = [None] * len(pieces)
++                groups = {}
++                for i, b in enumerate(bases):
++                    if is_paired_family(b) and not has_side(b):
++                        groups.setdefault(" ".join(b.upper().split()), []).append(i)
++                for key, idxs in groups.items():
++                    if len(idxs) != 2:
++                        continue
++                    idxs.sort(key=lambda i: pieces[i]["rect"].x0 + pieces[i]["rect"].x1)
++                    cx = lambda i: (pieces[i]["rect"].x0 + pieces[i]["rect"].x1) / 2
++                    if key != "SLV" and abs(cx(idxs[1]) - cx(idxs[0])) < 30:
++                        continue
++                    side_pref[idxs[0]], side_pref[idxs[1]] = "L", "R"
+                 single = len(pieces) == 1
+                 regions = [] if single else piece_regions(pd["clusters"], pd["rect"])
+                 assigned = [] if single else assign_labels([p["rect"] for p in pieces], regions, pd["rect"])
+-                for n_i, (p, clean) in enumerate(zip(pieces, parsed)):
++                used_lines = set()
++                for n_i, (p, clean) in enumerate(zip(pieces, bases)):
+                     label = p["rect"]
+                     if single:
+                         targets = [pd["union"] or legacy_window(label)]
+@@ -790,10 +1086,18 @@
+                         if not targets:
+                             targets = [legacy_window(label)]
+                             warnings.append(f"Pieza '{clean}': sin trazos detectables, ventana fija.")
+-                    if len(targets) > 1:
+-                        warnings.append(f"'{clean}': una etiqueta para {len(targets)} piezas.")
+-                    for k, t in enumerate(targets, 1):
+-                        add_piece(pd, clean, t, label, k, len(targets))
++                    specs, reason, claimed = plan_label(clean, lsizes[n_i], p.get("near_sizes"), side_pref[n_i],
++                                                        targets, pd["lines"], regions, used_lines)
++                    for li in claimed:
++                        used_lines.add(li)
++                        extra_remove.setdefault(pd["pno"], []).append(fitz.Rect(pd["lines"][li]["rect"]))
++                    if len(targets) > 1 and reason:
++                        warnings.append(f"'{clean}': una etiqueta para {len(targets)} piezas ({reason}); se numeraron.")
++                    for t, sp in zip(targets, specs):
++                        code = " ".join(x for x in (sp["side"], clean) if x)           # la talla no forma parte del nombre
++                        add_piece(pd, code, t, label, sp["part"], sp["parts"],
++                                  default_name=sided_default_name(sp["side"], clean) if sp["side"] else None,
++                                  sizes=sp["sizes"], variant="side" if sp["side"] else "")
+         elif doc.page_count > 1:
+             mode = "B: una pieza por página"
+             warnings.append("No hay 'Piece Name:'; se trató cada página como una pieza.")
+@@ -825,6 +1129,7 @@
+             for p in pd["pieces"]:
+                 rects += p["remove"]
+             rects += [l["rect"] for l in pd["lines"] if MEASURE_TEXT_RE.match(l["text"])]
++            rects += extra_remove.get(pd["pno"], [])
+             if rects:
+                 remove[pd["pno"]] = [_r(r) for r in rects]
+ 
+@@ -1837,6 +2142,7 @@
+                     <div class="flex items-start justify-between mb-2 gap-2">
+                         <div class="min-w-0">
+                             <span class="card-code text-[10px] font-mono text-red-400 bg-red-950/60 border border-red-900/40 px-1.5 py-0.5 rounded"></span>
++                            <span class="card-tallas hidden text-[10px] font-mono text-amber-300 bg-amber-950/50 border border-amber-900/40 px-1.5 py-0.5 rounded ml-1"></span>
+                             <input type="text" spellcheck="false" class="card-title w-full bg-transparent border border-transparent hover:border-zinc-700 focus:border-red-500 focus:bg-zinc-900 rounded px-1 -mx-1 mt-1 font-bold text-sm text-slate-100 focus:outline-none" title="Clic para corregir el nombre de esta pieza (Enter guarda, Esc cancela, vacío = automático)">
+                         </div>
+                         <span class="card-size text-xs text-zinc-400 font-mono shrink-0"></span>
+@@ -1891,6 +2197,8 @@
+             state.pieces.forEach(p => {
+                 const card = $('card-' + p.id); if (!card) return;
+                 card.querySelector('.card-code').textContent = `Código: ${p.code}`;
++                const tg = card.querySelector('.card-tallas');
++                if (p.sizes_label) { tg.textContent = `Tallas: ${p.sizes_label}`; tg.title = `Esta pieza comprende las tallas ${p.sizes.join(', ')} (columna SIZE en Costos y Excel)`; tg.classList.remove('hidden'); }
+                 const ti = card.querySelector('.card-title');
+                 if (document.activeElement !== ti) ti.value = pieceTitle(p);
+                 ti.classList.toggle('text-amber-300', !!customName(p));
+@@ -2160,6 +2468,13 @@
+ 
+         // ================= Integración con el Sistema de Costos =================
+         const SIZE_ORDER = ['XS', 'S', 'M', 'L', 'XL', '2XL', '3XL', '4XL', '5XL'];
++        // Letras (XS..5XL) y, después, las tallas numéricas (40, 44, 48...) detectadas en el PDF o propias de alguna pieza.
++        const isNumSize = s => /^\d+$/.test(String(s));
++        function allSizes() {
++            const nums = new Set();
++            [...(state.sizesDetected || []), ...(state.sizesSel || []), ...((state.pieces || []).flatMap(p => p.sizes || []))].forEach(s => { if (isNumSize(s)) nums.add(String(s)); });
++            return SIZE_ORDER.concat([...nums].sort((a, b) => a - b));
++        }
+         const USER_TEAMS_KEY = 'tegra_team_catalog_v1';
+         const loadUserTeams = () => { try { return JSON.parse(localStorage.getItem(USER_TEAMS_KEY) || '{}'); } catch { return {}; } };
+         const saveUserTeams = () => { try { localStorage.setItem(USER_TEAMS_KEY, JSON.stringify(state.userTeams)); } catch {} };
+@@ -2191,7 +2506,7 @@
+ 
+         function renderSizeChips(source) {
+             const box = $('sizeChips'); box.innerHTML = '';
+-            SIZE_ORDER.forEach(s => {
++            allSizes().forEach(s => {
+                 const b = document.createElement('button');
+                 b.type = 'button'; b.textContent = s;
+                 const paint = () => { b.className = 'px-1.5 py-0.5 rounded border text-[10px] font-mono transition ' +
+@@ -2250,11 +2565,14 @@
+             const names = fileNames();
+             const q = costQuery().toString();
+             const sendRefs = $('chkSendRefs').checked, rq = refQuery().toString();
++            const sel = allSizes().filter(s => state.sizesSel.has(s));
++            // Talla propia de la pieza (la del bloque de su etiqueta), limitada a las tallas seleccionadas arriba; sin talla propia, se usa la lista global.
++            const tallasDe = p => { const own = p.sizes || []; if (!own.length || !sel.length) return own; const f = own.filter(s => sel.includes(s)); return f.length ? f : own; };
+             const payload = {
+                 origen: state.docId, pdf: state.fileName, style: state.style,
+                 teamName: state.teamName || state.teamCode || '', category: state.category,
+-                sizes: SIZE_ORDER.filter(s => state.sizesSel.has(s)),
+-                pieces: items.map(p => ({ id: p.id, placement: pieceLabel(p), file: names[p.id],
++                sizes: sel,
++                pieces: items.map(p => ({ id: p.id, placement: pieceLabel(p), file: names[p.id], sizes: tallasDe(p),
+                                           url: `/api/piece/${state.docId}/${p.id}.png?${q}`,
+                                           refUrl: (sendRefs && !state.noRef.has(p.id)) ? `/api/piece/${state.docId}/${p.id}.png?${rq}` : '' })),
+             };
+@@ -2883,6 +3201,9 @@
+     <script>
+         let imagenesProcesadas = [];
+         let tallasSeleccionadas = new Set(['XS', 'S', 'M', 'L', 'XL', '2XL', '3XL', '4XL', '5XL']);
++        const TALLAS_LETRAS = ['XS', 'S', 'M', 'L', 'XL', '2XL', '3XL', '4XL', '5XL'];
++        let tallasNumericas = new Set();       // tallas numéricas (40, 44, 48...) recibidas del extractor: se muestran junto a las de letras
++        const tallasVisibles = () => TALLAS_LETRAS.concat(Array.from(tallasNumericas).sort((a, b) => a - b));
+         
+         const dropZone = document.getElementById('dropZone');
+         const fileInput = document.getElementById('fileInput');
+@@ -2898,7 +3219,7 @@
+         
+         // ========== INICIALIZACIÓN ==========
+         function inicializarTallas() {
+-            const tallas = ['XS', 'S', 'M', 'L', 'XL', '2XL', '3XL', '4XL', '5XL'];
++            const tallas = tallasVisibles();
+             tallasGrid.innerHTML = '';
+             
+             tallas.forEach(talla => {
+@@ -2924,8 +3245,8 @@
+         }
+         
+         function seleccionarTodasTallas() {
+-            const todasSeleccionadas = tallasSeleccionadas.size === 9;
+-            const tallas = ['XS', 'S', 'M', 'L', 'XL', '2XL', '3XL', '4XL', '5XL'];
++            const tallas = tallasVisibles();
++            const todasSeleccionadas = tallas.every(t => tallasSeleccionadas.has(t));
+             
+             if (todasSeleccionadas) {
+                 tallasSeleccionadas.clear();
+@@ -3990,10 +4311,12 @@
+             return items.length;
+         }
+ 
+-        // p = { origen, pdf, style, teamName, sizes:[], pieces:[{id, placement, file, url, refUrl}] }
++        // p = { origen, pdf, style, teamName, sizes:[], pieces:[{id, placement, file, sizes:[], url, refUrl}] }
++        // pieces[].sizes: tallas propias de esa pieza (p. ej. un cuello solo para S-M); si no trae, se usan las de p.sizes
+         async function recibirDesdeExtractor(p) {
+             const piezas = p.pieces || [];
+             const fallos = [];
++            [].concat(p.sizes || [], ...piezas.map(pz => pz.sizes || [])).forEach(t => { if (/^\d+$/.test(String(t))) tallasNumericas.add(String(t)); });
+             if (p.sizes && p.sizes.length) {
+                 tallasSeleccionadas = new Set(p.sizes);
+                 inicializarTallas();
+@@ -4023,7 +4346,8 @@
+                     }
+                     procesarImagen(img, file, dpiInfo, {
+                         origen: p.origen, style: p.style, teamName: p.teamName,
+-                        placement: pz.placement, tallas: tallasTxt, refSrc: refSrc, categoria: p.category || ''
++                        placement: pz.placement, tallas: (pz.sizes && pz.sizes.length) ? pz.sizes.join('-') : tallasTxt,
++                        refSrc: refSrc, categoria: p.category || ''
+                     });
+                     ok++;
+                 } catch (err) {
