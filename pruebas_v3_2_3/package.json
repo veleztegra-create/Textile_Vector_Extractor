@@ -1,0 +1,6 @@
+{
+  "name": "pruebas-costos-dpi",
+  "private": true,
+  "description": "Dependencias de las pruebas de DPI del módulo Costos",
+  "dependencies": { "jsdom": "^26.0.0", "jszip": "^3.10.1" }
+}
